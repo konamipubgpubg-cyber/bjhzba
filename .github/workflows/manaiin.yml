@@ -1,0 +1,399 @@
+name: Build Eden Android (custom)
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_only:
+        description: "Dry run: clone + patch + show diff only (no APK build)"
+        type: boolean
+        default: false
+      gradle_task:
+        description: "Gradle task used to build the APK"
+        type: string
+        default: "assembleMainlineRelease"
+
+env:
+  EDEN_REPO: "https://github.com/eden-emulator/mirror.git"
+  EDEN_COMMIT: "37fe9119526c03ca064166130cc983c55b9a9e86"
+  NDK_VERSION: "26.1.10909125"
+  CMAKE_VERSION: "3.22.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install glslang-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+          glslangValidator --version
+
+      - name: Install Android SDK 34, NDK and CMake
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Clone Eden at the pinned commit
+        run: |
+          git clone "$EDEN_REPO" eden
+          cd eden
+          git checkout "$EDEN_COMMIT"
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "$EDEN_COMMIT"
+
+      - name: Write patch files
+        run: |
+          mkdir -p patches
+
+          cat > patches/fab_helper.kt <<'KT_FAB'
+              // ---- Eden custom: floating Pause / Resume button ----
+              private var edenUserPaused = false
+
+              private fun setupEdenPauseButton() {
+                  val fab = com.google.android.material.floatingactionbutton.FloatingActionButton(this)
+                  fab.setSize(com.google.android.material.floatingactionbutton.FloatingActionButton.SIZE_MINI)
+                  fab.setImageResource(android.R.drawable.ic_media_pause)
+                  fab.contentDescription = "Pause / Resume"
+                  fab.setOnClickListener {
+                      if (edenUserPaused) {
+                          @@NL@@.unpauseEmulation()
+                          edenUserPaused = false
+                          fab.setImageResource(android.R.drawable.ic_media_pause)
+                      } else {
+                          @@NL@@.pauseEmulation()
+                          edenUserPaused = true
+                          fab.setImageResource(android.R.drawable.ic_media_play)
+                      }
+                  }
+                  val margin = (16 * resources.displayMetrics.density).toInt()
+                  val params = android.widget.FrameLayout.LayoutParams(
+                      android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                      android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
+                  )
+                  params.gravity = android.view.Gravity.BOTTOM or android.view.Gravity.END
+                  params.setMargins(margin, margin, margin, margin)
+                  addContentView(fab, params)
+              }
+          KT_FAB
+
+          cat > patches/overlay_helper.kt <<'KT_OVERLAY'
+              // ---- Eden custom: L button toggle ----
+              private var edenLToggled = false
+
+              private fun edenButtonEvent(player: Int, id: Int, status: Int) {
+                  if (id == NativeLibrary.ButtonType.TRIGGER_L) {
+                      if (status == NativeLibrary.ButtonState.PRESSED) {
+                          edenLToggled = !edenLToggled
+                          val newState = if (edenLToggled) {
+                              NativeLibrary.ButtonState.PRESSED
+                          } else {
+                              NativeLibrary.ButtonState.RELEASED
+                          }
+                          NativeLibrary.onGamePadButtonEvent(player, id, newState)
+                      }
+                      return
+                  }
+                  NativeLibrary.onGamePadButtonEvent(player, id, status)
+              }
+
+              // ---- Eden custom: swipe camera (right stick) ----
+              private var edenSwipePointerId = -1
+              private var edenSwipeLastX = 0f
+              private var edenSwipeLastY = 0f
+              private var edenSwipeLastTime = 0L
+              private val edenSwipeSensitivity = 1.0f
+              private val edenSwipeReferenceSpeed = 900f
+              private val edenSwipeStopRunnable = Runnable { edenSendCamera(0f, 0f) }
+
+              private fun isSwipeCameraArea(x: Float, y: Float): Boolean {
+                  return x >= width * 0.55f &&
+                      y >= height * 0.45f &&
+                      y <= height.toFloat()
+              }
+
+              private fun edenSendCamera(x: Float, y: Float) {
+                  NativeLibrary.onGamePadJoystickEvent(@@PLAYER@@, NativeLibrary.ButtonType.STICK_R, x, y)
+              }
+
+              private fun edenStopSwipe() {
+                  removeCallbacks(edenSwipeStopRunnable)
+                  edenSwipePointerId = -1
+                  edenSendCamera(0f, 0f)
+              }
+
+              private fun handleSwipeCamera(event: MotionEvent, controlHandled: Boolean): Boolean {
+                  when (event.actionMasked) {
+                      MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                          if (edenSwipePointerId != -1 || controlHandled) {
+                              return false
+                          }
+                          val index = event.actionIndex
+                          val x = event.getX(index)
+                          val y = event.getY(index)
+                          if (!isSwipeCameraArea(x, y)) {
+                              return false
+                          }
+                          edenSwipePointerId = event.getPointerId(index)
+                          edenSwipeLastX = x
+                          edenSwipeLastY = y
+                          edenSwipeLastTime = event.eventTime
+                          return true
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (edenSwipePointerId == -1) {
+                              return false
+                          }
+                          val index = event.findPointerIndex(edenSwipePointerId)
+                          if (index < 0) {
+                              edenStopSwipe()
+                              return false
+                          }
+                          val x = event.getX(index)
+                          val y = event.getY(index)
+                          val dt = (event.eventTime - edenSwipeLastTime) / 1000f
+                          if (dt > 0f) {
+                              val vx = (x - edenSwipeLastX) / dt
+                              val vy = (y - edenSwipeLastY) / dt
+                              val axisX = (vx / edenSwipeReferenceSpeed * edenSwipeSensitivity).coerceIn(-1f, 1f)
+                              val axisY = (-vy / edenSwipeReferenceSpeed * edenSwipeSensitivity).coerceIn(-1f, 1f)
+                              edenSendCamera(axisX, axisY)
+                              edenSwipeLastX = x
+                              edenSwipeLastY = y
+                              edenSwipeLastTime = event.eventTime
+                              removeCallbacks(edenSwipeStopRunnable)
+                              postDelayed(edenSwipeStopRunnable, 50L)
+                          }
+                          return true
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
+                          if (edenSwipePointerId == -1) {
+                              return false
+                          }
+                          if (event.actionMasked == MotionEvent.ACTION_CANCEL ||
+                              event.getPointerId(event.actionIndex) == edenSwipePointerId
+                          ) {
+                              edenStopSwipe()
+                              return true
+                          }
+                          return false
+                      }
+                  }
+                  return false
+              }
+          KT_OVERLAY
+
+          cat > patches/apply.py <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          ANDROID = pathlib.Path("eden/src/android")
+          PATCH_DIR = pathlib.Path("patches")
+
+
+          def die(msg, text=None):
+              print("")
+              print("PATCH FAILED: " + msg)
+              if text:
+                  print("----- relevant source -----")
+                  print(text)
+              sys.exit(1)
+
+
+          def find_file(name):
+              hits = sorted(p for p in ANDROID.rglob(name) if "/build/" not in p.as_posix())
+              if len(hits) != 1:
+                  die("expected exactly one " + name + ", found: " + str(hits))
+              return hits[0]
+
+
+          def grep(text, pattern):
+              out = []
+              for number, line in enumerate(text.splitlines(), 1):
+                  if re.search(pattern, line):
+                      out.append(str(number) + ": " + line)
+              return "\n".join(out)
+
+
+          def line_start(text, index):
+              pos = text.rfind("\n", 0, index) + 1
+              while pos > 0:
+                  prev_end = pos - 1
+                  prev_start = text.rfind("\n", 0, prev_end) + 1
+                  if text[prev_start:prev_end].strip().startswith("@"):
+                      pos = prev_start
+                  else:
+                      break
+              return pos
+
+
+          def remove_stick_r(src):
+              removed = 0
+              needle = "overlayJoysticks.add("
+              start = 0
+              while True:
+                  i = src.find(needle, start)
+                  if i < 0:
+                      break
+                  j = i + len(needle)
+                  depth = 1
+                  while j < len(src) and depth > 0:
+                      if src[j] == "(":
+                          depth += 1
+                      elif src[j] == ")":
+                          depth -= 1
+                      j += 1
+                  if re.search(r"\bSTICK_R\b", src[i:j]):
+                      src = src[:i] + "Unit" + src[j:]
+                      removed += 1
+                      start = i + 4
+                  else:
+                      start = j
+              return src, removed
+
+
+          # ---------- NativeLibrary checks ----------
+          nl_path = find_file("NativeLibrary.kt")
+          nl = nl_path.read_text()
+          pkg = re.search(r"^package\s+([\w.]+)", nl, re.M)
+          if not pkg:
+              die("no package line in NativeLibrary.kt")
+          NL_FQN = pkg.group(1) + ".NativeLibrary"
+
+          checks = {
+              "pauseEmulation": r"fun\s+pauseEmulation\s*\(",
+              "unpauseEmulation": r"fun\s+unpauseEmulation\s*\(",
+              "TRIGGER_L": r"\bTRIGGER_L\b",
+              "STICK_R": r"\bSTICK_R\b",
+              "PRESSED": r"\bPRESSED\b",
+              "RELEASED": r"\bRELEASED\b",
+          }
+          for label, pattern in checks.items():
+              if not re.search(pattern, nl):
+                  die("NativeLibrary.kt has no " + label, grep(nl, r"external fun|object |const val"))
+
+          btn_sig = re.search(r"fun\s+onGamePadButtonEvent\s*\(([^)]*)\)", nl)
+          joy_sig = re.search(r"fun\s+onGamePadJoystickEvent\s*\(([^)]*)\)", nl)
+          if not btn_sig or re.findall(r":\s*(\w+)", btn_sig.group(1)) != ["Int", "Int", "Int"]:
+              die("onGamePadButtonEvent signature is not (Int, Int, Int)", grep(nl, r"onGamePad"))
+          if not joy_sig or re.findall(r":\s*(\w+)", joy_sig.group(1)) != ["Int", "Int", "Float", "Float"]:
+              die("onGamePadJoystickEvent signature is not (Int, Int, Float, Float)", grep(nl, r"onGamePad"))
+
+          # ---------- Feature 1: EmulationActivity (pause / resume FAB) ----------
+          act_path = find_file("EmulationActivity.kt")
+          act = act_path.read_text()
+          m = re.search(r"setContentView\(\s*binding\.root\s*\)", act)
+          if not m:
+              die("setContentView(binding.root) not found", grep(act, r"setContentView|binding"))
+          act = act[:m.end()] + "\n        setupEdenPauseButton()" + act[m.end():]
+          m = re.search(r"override\s+fun\s+onCreate\s*\(", act)
+          if not m:
+              die("override fun onCreate( not found", grep(act, r"fun onCreate"))
+          fab = (PATCH_DIR / "fab_helper.kt").read_text().replace("@@NL@@", NL_FQN)
+          pos = line_start(act, m.start())
+          act = act[:pos] + fab + "\n" + act[pos:]
+          act_path.write_text(act)
+          print("OK: pause/resume FAB patched into " + str(act_path))
+
+          # ---------- Features 2 and 3: InputOverlay ----------
+          ov_path = find_file("InputOverlay.kt")
+          ov = ov_path.read_text()
+
+          button_call = re.compile(
+              r"NativeLibrary\.onGamePadButtonEvent\(\s*([^,()]+?)\s*,\s*([\w.]+)\s*,\s*([\w.]+)\s*,?\s*\)"
+          )
+          calls = button_call.findall(ov)
+          if not calls:
+              die("no NativeLibrary.onGamePadButtonEvent(...) calls found", grep(ov, r"onGamePad"))
+          player = calls[0][0].strip()
+          ov = button_call.sub(
+              lambda mm: "edenButtonEvent(%s, %s, %s)" % (mm.group(1), mm.group(2), mm.group(3)), ov
+          )
+          print("OK: L toggle wired into " + str(len(calls)) + " button call(s)")
+
+          ov, removed = remove_stick_r(ov)
+          if removed == 0:
+              die("could not find overlayJoysticks.add(... STICK_R ...)", grep(ov, r"overlayJoysticks|STICK_R"))
+          print("OK: removed " + str(removed) + " R-Stick overlay joystick(s)")
+
+          sig = re.search(
+              r"fun\s+onTouch\s*\(\s*\w+\s*:\s*View\??\s*,\s*(\w+)\s*:\s*MotionEvent\s*\)", ov
+          )
+          if not sig:
+              die("onTouch(View, MotionEvent) not found", grep(ov, r"fun onTouch"))
+          event_name = sig.group(1)
+          tail = re.search(r"if\s*\(\s*(\w+)\s*\)\s*\{\s*invalidate\(\)\s*\}", ov[sig.end():])
+          if not tail:
+              die("'if (flag) { invalidate() }' not found inside onTouch", grep(ov, r"invalidate|shouldUpdate"))
+          insert_at = sig.end() + tail.end()
+          call = "\n\n        if (handleSwipeCamera(%s, %s)) {\n            return true\n        }\n" % (
+              event_name, tail.group(1)
+          )
+          ov = ov[:insert_at] + call + ov[insert_at:]
+
+          helper = (PATCH_DIR / "overlay_helper.kt").read_text().replace("@@PLAYER@@", player)
+          pos = line_start(ov, sig.start())
+          ov = ov[:pos] + helper + "\n" + ov[pos:]
+          ov_path.write_text(ov)
+          print("OK: swipe camera patched into " + str(ov_path))
+          PY
+
+      - name: Apply patches
+        run: |
+          python3 -m py_compile patches/apply.py
+          python3 patches/apply.py
+
+      - name: Show patch diff
+        run: |
+          git -C eden diff --stat
+          git -C eden diff > eden-custom.patch
+          cat eden-custom.patch
+
+      - name: Upload patch diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-custom-patch
+          path: eden-custom.patch
+          if-no-files-found: ignore
+
+      - name: List Gradle assemble tasks (dry run only)
+        if: "${{ inputs.patch_only == true }}"
+        working-directory: eden/src/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon -q tasks --all | grep -i "^assemble" || true
+
+      - name: Build APK
+        if: "${{ inputs.patch_only != true }}"
+        working-directory: eden/src/android
+        env:
+          GRADLE_TASK: ${{ inputs.gradle_task }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon "$GRADLE_TASK"
+
+      - name: Collect APK
+        if: "${{ inputs.patch_only != true }}"
+        run: |
+          mkdir -p out
+          find eden/src/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} out/ \;
+          ls -la out
+          test -n "$(ls -A out)"
+
+      - name: Upload APK
+        if: "${{ inputs.patch_only != true }}"
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-custom-apk
+          path: out/*.apk
+          if-no-files-found: error
